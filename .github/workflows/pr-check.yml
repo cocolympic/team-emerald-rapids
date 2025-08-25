@@ -1,0 +1,196 @@
+name: 🩷 Claude Python Keyword Checker
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  check-py-files:
+    name: "Check new Python files can run"
+    runs-on: ubuntu-latest
+    outputs:
+      repo_name: ${{ steps.extract.outputs.repo_name }}
+      new_word: ${{ steps.extract.outputs.new_word }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find new Python files and check syntax
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 Checking new Python files..."
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME=$(basename "${{ github.repository }}")
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+
+          RAW=$(gh pr view "$PR_NUMBER" --repo "$OWNER/$REPO_NAME" --json files)
+          FILES=$(echo "$RAW" | jq -r '.files[].path' | grep '\.py$' || true)
+
+          echo "📄 Python files found:"
+          echo "$FILES"
+
+          if [ -z "$FILES" ]; then
+            echo "✅ No new Python files found."
+            echo "new_word=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "🧪 Checking Python syntax..."
+          for file in $FILES; do
+            python3 -m py_compile "$file" || exit 1
+          done
+
+          FIRST_FILE=$(echo "$FILES" | head -n 1)
+          FILE_NAME=$(basename "$FIRST_FILE" .py)
+          NEW_WORD=$(echo "$FILE_NAME" | sed -E 's/^[0-9]+_//' | tr '[:upper:]' '[:lower:]')
+          echo "new_word=$NEW_WORD" >> "$GITHUB_OUTPUT"
+
+  check-commit-author:
+    name: "Check for consecutive commit authors"
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.set-result.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load admin list
+        run: |
+          if [ -f "admin.txt" ]; then
+            cat admin.txt | sort -u > admins.txt
+          else
+            touch admins.txt
+          fi
+
+      - name: Check for duplicate commit authors
+        id: set-result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          OWNER=${{ github.repository_owner }}
+          REPO=$(basename "${{ github.repository }}")
+
+          mapfile -t ADMIN_USERS < admins.txt
+
+          authors=$(gh api graphql -f query='
+            query($owner:String!, $repo:String!, $number:Int!) {
+              repository(owner:$owner, name:$repo) {
+                pullRequest(number:$number) {
+                  commits(first:100) {
+                    nodes {
+                      commit {
+                        author {
+                          name
+                          user { login }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+          -f owner="$OWNER" -f repo="$REPO" -F number="$PR_NUMBER" \
+          --jq '.data.repository.pullRequest.commits.nodes[].commit.author.user.login')
+
+          BOT_USERS=("dependabot[bot]" "github-actions[bot]")
+          prev=""
+          duplicated=""
+
+          while read -r author; do
+            skip=false
+            for bot in "${BOT_USERS[@]}"; do
+              [ "$author" = "$bot" ] && skip=true
+            done
+            [ "$skip" = true ] && continue
+
+            if [ "$author" = "$prev" ]; then
+              duplicated="$author"
+              break
+            fi
+            prev="$author"
+          done <<< "$authors"
+
+          if [ -n "$duplicated" ]; then
+            for admin in "${ADMIN_USERS[@]}"; do
+              if [ "$duplicated" = "$admin" ]; then
+                echo "⚠️ admin ${duplicated} の連続コミットは許可されています。"
+                echo "result=pass" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+            echo "❌ 重複 author: $duplicated"
+            gh pr comment "$PR_NUMBER" --body "❌ **${duplicated}** が連続コミットしています。" --repo "$OWNER/$REPO"
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "✅ 重複 author なし"
+          echo "result=pass" >> "$GITHUB_OUTPUT"
+
+  check-shiritori-chain:
+    name: "Check shiritori chain with DynamoDB"
+    needs: check-py-files
+    if: ${{ needs.check-py-files.outputs.new_word != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Run shiritori chain check
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ap-northeast-1
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ needs.check-py-files.outputs.repo_name }}
+          NEW_WORD: ${{ needs.check-py-files.outputs.new_word }}
+        run: python3 scripts/check_shiritori.py
+
+  review-via-claude:
+    name: "AI Keyword Check via Claude Code"
+    needs: [check-py-files, check-commit-author, check-shiritori-chain]
+    if: ${{ needs.check-commit-author.outputs.result != 'fail' }}
+    runs-on: ubuntu-latest
+    outputs:
+      summary: ${{ steps.claude.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trigger Claude review
+        id: claude
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: "./claude_prompt.txt"
+          allowed_tools: "GlobTool,Bash,View,Write,Read,Edit"
+          max_turns: "30"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+  fail-on-error:
+    name: "Fail on ❌ in latest comment"
+    needs: [review-via-claude, check-commit-author]
+    runs-on: ubuntu-latest
+    if: ${{ always() && (github.event.pull_request.number == 1 || needs.check-commit-author.outputs.result != 'fail') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for ❌ in latest PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          latest=$(gh pr view ${{ github.event.pull_request.number }} --json comments -q ".comments[-1].body")
+          echo "$latest" | grep -q "❌" && exit 1 || exit 0

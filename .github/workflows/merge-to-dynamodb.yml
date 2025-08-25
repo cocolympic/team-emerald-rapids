@@ -1,0 +1,72 @@
+name: 🗃️ Insert Shiritori Word to DynamoDB on Merge
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  upload-shiritori-word:
+    name: "Extract Python filename and upload to DynamoDB"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1
+
+      - name: Fetch base branch to compare diff
+        run: |
+          git fetch origin ${{ github.event.before }} --depth=1 || echo "Fallback: could not fetch previous commit"
+
+      - name: Extract current_word from merged .py file
+        id: extract_word
+        run: |
+          base_commit=${{ github.event.before }}
+          head_commit=${{ github.sha }}
+
+          echo "📌 Base: $base_commit"
+          echo "📌 Head: $head_commit"
+
+          files=$(git diff --name-only "$base_commit" "$head_commit" | grep '\.py$' | sed -E 's|.*/||' | sed -E 's|\.py$||')
+          current_word=$(echo "$files" | head -n 1 | sed -E 's/^[0-9]+_//')
+
+          if [ -z "$current_word" ]; then
+            echo "❌ Pythonファイルが見つかりません"
+            exit 1
+          fi
+
+          echo "✅ current_word = $current_word"
+          echo "current_word=$current_word" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to DynamoDB
+        run: |
+          WORD_TABLE="pytori_shiritori"
+          ID=$(date +%s%N | cut -b1-13)
+          REPO_NAME=$(basename "${{ github.repository }}")
+          MERGED_ON=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          CURRENT_WORD="${{ steps.extract_word.outputs.current_word }}"
+
+          # 13桁の擬似ID（ミリ秒）
+          ID=$(date +%s%3N)
+
+          echo "📝 Inserting into DynamoDB: $WORD_TABLE"
+          echo "📦 ID: $ID"
+          echo "📦 Repo: $REPO_NAME"
+          echo "📦 Word: $CURRENT_WORD"
+          echo "📦 Time: $MERGED_ON"
+
+          aws dynamodb put-item \
+            --table-name "$WORD_TABLE" \
+            --item '{
+              "id": {"N": "'$ID'"},
+              "repository_name": {"S": "'$REPO_NAME'"},
+              "current_word": {"S": "'$CURRENT_WORD'"},
+              "merged_on": {"S": "'$MERGED_ON'"}
+            }'
