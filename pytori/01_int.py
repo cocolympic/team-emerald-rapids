@@ -1,0 +1,4 @@
+BINARY = '1001000101001'
+print(f"2進数：{BINARY}")
+DECIMAL = int(BINARY, 2)
+print(f"10進数：{DECIMAL}")
